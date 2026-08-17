@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.io.FileInputStream
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 
 plugins {
@@ -29,16 +30,16 @@ android {
     // (`public static final String GEMINI_API_KEY = ;`). Reading and quoting it
     // ourselves guarantees valid output whether or not a key is configured.
     val geminiApiKey: String = run {
-      val props = java.util.Properties()
+      val props = Properties()
       val envFile = rootProject.file(".env")
       val envExampleFile = rootProject.file(".env.example")
-      when {
-        envFile.exists() -> envFile.inputStream().use { props.load(it) }
-        envExampleFile.exists() -> envExampleFile.inputStream().use { props.load(it) }
+      val fileToRead = if (envFile.exists()) envFile else if (envExampleFile.exists()) envExampleFile else null
+      if (fileToRead != null) {
+        val stream = FileInputStream(fileToRead)
+        stream.use { props.load(it) }
       }
-      (props.getProperty("GEMINI_API_KEY")
-        ?: System.getenv("GEMINI_API_KEY")
-        ?: "").trim().trim('"')
+      val raw = props.getProperty("GEMINI_API_KEY") ?: System.getenv("GEMINI_API_KEY") ?: ""
+      raw.trim().trim('"')
     }
     buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
   }
