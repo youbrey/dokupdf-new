@@ -21,6 +21,25 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    // GEMINI_API_KEY is generated here explicitly (instead of leaving it to the
+    // Secrets Gradle Plugin) because that plugin's quoting behaviour for blank
+    // values is inconsistent and previously produced invalid Java
+    // (`public static final String GEMINI_API_KEY = ;`). Reading and quoting it
+    // ourselves guarantees valid output whether or not a key is configured.
+    val geminiApiKey: String = run {
+      val props = java.util.Properties()
+      val envFile = rootProject.file(".env")
+      val envExampleFile = rootProject.file(".env.example")
+      when {
+        envFile.exists() -> envFile.inputStream().use { props.load(it) }
+        envExampleFile.exists() -> envExampleFile.inputStream().use { props.load(it) }
+      }
+      (props.getProperty("GEMINI_API_KEY")
+        ?: System.getenv("GEMINI_API_KEY")
+        ?: "").trim().trim('"')
+    }
+    buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
   }
 
   signingConfigs {
@@ -74,6 +93,9 @@ secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+  // Generated manually above (see defaultConfig) with guaranteed-valid quoting,
+  // so the plugin should not also try to inject this key itself.
+  ignoreList.add("GEMINI_API_KEY")
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
