@@ -86,7 +86,18 @@ data class ScannedPageItem(
             val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
             bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
         }
-        return FilterProcessor.applyFilter(bmp, filterType)
+        val rendered = FilterProcessor.applyFilter(bmp, filterType)
+        // FilterType.ORIGINAL with default brightness/contrast returns `source` unchanged
+        // (see FilterProcessor.applyFilter), which -- when rotationDegrees == 0 -- would
+        // otherwise be the exact same object as `originalBitmap`. Callers of this function
+        // (PDF export in particular) treat the result as a disposable, owned copy and may
+        // recycle it once they're done; without this guard that could recycle the bitmap this
+        // page is still displaying/relying on, crashing on the next redraw.
+        return if (rendered === originalBitmap) {
+            rendered.copy(rendered.config ?: Bitmap.Config.ARGB_8888, false)
+        } else {
+            rendered
+        }
     }
 }
 
@@ -347,18 +358,33 @@ fun ScannerScreen(
                     val docsDir = File(context.filesDir, "documents").apply { mkdirs() }
                     val destFile = File(docsDir, fileName)
 
-                    val renderedBitmaps = withContext(Dispatchers.Default) {
-                        scannedPages.map { it.getRenderedBitmap() }
-                    }
+                    try {
+                        // Rendering every page's filter output up front (rather than streaming
+                        // page-by-page) means all pages' full-res pixels are briefly resident at
+                        // once; this is the other spot high memory pressure was likely to surface,
+                        // in addition to capture itself. bitmapsToPdf() now recycles each bitmap
+                        // right after it's drawn, but the OOM can still happen here, before that
+                        // function is ever reached, while this list is being built.
+                        val renderedBitmaps = withContext(Dispatchers.Default) {
+                            scannedPages.map { it.getRenderedBitmap() }
+                        }
 
-                    val result = converter.bitmapsToPdf(renderedBitmaps, destFile)
-                    isSavingPdf = false
+                        val result = converter.bitmapsToPdf(renderedBitmaps, destFile)
 
-                    if (result.isSuccess) {
-                        repository.refreshDocuments()
-                        savedPdfFile = destFile
-                    } else {
-                        Toast.makeText(context, "Gagal membuat PDF: ${result.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                        if (result.isSuccess) {
+                            repository.refreshDocuments()
+                            savedPdfFile = destFile
+                        } else {
+                            Toast.makeText(context, "Gagal membuat PDF: ${result.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (oom: OutOfMemoryError) {
+                        Toast.makeText(
+                            context,
+                            "Memori tidak cukup untuk menyimpan PDF. Coba kurangi jumlah halaman per sesi atau matikan mode kualitas HD.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } finally {
+                        isSavingPdf = false
                     }
                 }
             },
@@ -660,6 +686,12 @@ fun ScannerScreen(
                                                     if (selectedScanMode == ScanMode.SINGLE_PAGE) {
                                                         isReviewMode = true
                                                     }
+                                                } else {
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Gagal memproses foto (memori tidak cukup). Coba tutup aplikasi lain lalu ulangi.",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
                                                 }
                                             }
                                         }
@@ -1214,20 +1246,60 @@ fun MultiPageReviewScreen(
 }
 
 /**
- * Utility helper to convert ImageProxy into a properly oriented Bitmap
+ * Utility helper to convert ImageProxy into a properly oriented Bitmap.
+ *
+ * BUG FIX (force close on capture): this previously decoded the full sensor-resolution JPEG
+ * (often 12-108MP -> 50-400MB+ as an ARGB_8888 bitmap) with no bounds check, no downsampling,
+ * and no try/catch. `BitmapFactory.decodeByteArray` throws `OutOfMemoryError`, which is an
+ * `Error`, not an `Exception` -- none of the `catch (e: Exception)` blocks elsewhere in this
+ * file could ever catch it. Since this runs on `onCaptureSuccess`, which executes on
+ * `cameraExecutor` (a background thread), an uncaught OOM there crashes the whole process
+ * immediately, which matches the reported "force close saat pengambilan gambar". It got worse
+ * page after page in Multi-Page mode because every previous page's full-res bitmap was still
+ * held in memory (never downsampled, never recycled), so later captures were increasingly
+ * likely to be the one that finally pushes the heap over the edge -- explaining why it was
+ * intermittent rather than 100% reproducible.
+ *
+ * Fix: read the JPEG's dimensions first (cheap, no pixel allocation), compute an inSampleSize
+ * that caps the long edge at [maxDimension] px (2600px is already well beyond what's needed for
+ * a sharp document scan / OCR pass), decode at that size, and catch OutOfMemoryError explicitly
+ * so a failed capture degrades to "gagal, coba lagi" instead of killing the app.
  */
-private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
-    val plane = imageProxy.planes[0]
-    val buffer = plane.buffer
-    val bytes = ByteArray(buffer.remaining())
-    buffer.get(bytes)
-    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+private fun imageProxyToBitmap(imageProxy: ImageProxy, maxDimension: Int = 2600): Bitmap? {
+    return try {
+        val plane = imageProxy.planes[0]
+        val buffer = plane.buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
 
-    val rotation = imageProxy.imageInfo.rotationDegrees
-    return if (rotation != 0) {
-        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-        Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-    } else {
-        bmp
+        val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
+        val srcWidth = boundsOptions.outWidth
+        val srcHeight = boundsOptions.outHeight
+        if (srcWidth <= 0 || srcHeight <= 0) return null
+
+        var sampleSize = 1
+        while ((srcWidth / sampleSize) > maxDimension || (srcHeight / sampleSize) > maxDimension) {
+            sampleSize *= 2
+        }
+
+        val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions) ?: return null
+
+        val rotation = imageProxy.imageInfo.rotationDegrees
+        if (rotation != 0) {
+            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+            val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+            if (rotated !== bmp) bmp.recycle()
+            rotated
+        } else {
+            bmp
+        }
+    } catch (oom: OutOfMemoryError) {
+        System.gc()
+        null
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
     }
 }
