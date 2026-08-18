@@ -1,6 +1,7 @@
 package com.example
 
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -28,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.core.model.DocumentModel
 import com.example.core.model.PageModel
+import com.example.core.pdf.PdfRendererEngine
 import com.example.core.repository.DocumentRepository
 import com.example.core.repository.SavedDocumentItem
 import com.example.ui.screens.DocumentEditorScreen
@@ -61,10 +63,12 @@ fun DokuPdfApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val repository = remember { DocumentRepository(context) }
+    val pdfRenderer = remember { PdfRendererEngine(context) }
 
     var currentScreen by remember { mutableStateOf(AppScreen.HOME) }
     var selectedDocumentModel by remember { mutableStateOf<DocumentModel?>(null) }
     var searchQuery by remember { mutableStateOf("") }
+    var isOpeningDocument by remember { mutableStateOf(false) }
     val documents by repository.documents.collectAsState()
 
     LaunchedEffect(Unit) {
@@ -95,12 +99,52 @@ fun DokuPdfApp() {
                         searchQuery = searchQuery,
                         onSearchChange = { searchQuery = it },
                         onOpenDocument = { doc ->
-                            selectedDocumentModel = DocumentModel(
-                                title = doc.title,
-                                filePath = doc.file.absolutePath,
-                                pages = listOf(PageModel(pageIndex = 0))
-                            )
-                            currentScreen = AppScreen.EDITOR
+                            // BUG FIX: this previously created `PageModel(pageIndex = 0)` with
+                            // every field at its default (originalBitmap = null, blocks = empty).
+                            // RenderEngine.renderPage() only draws page.processedBitmap /
+                            // originalBitmap, falling back to page.blocks if both are null --
+                            // since a scanned PDF has neither, the Canvas Engine editor always
+                            // opened to a blank page regardless of what the PDF actually
+                            // contained. Fix: actually rasterize the saved PDF's pages (the app
+                            // already does this correctly for the Home screen thumbnail via the
+                            // same PdfRendererEngine) and hand them to the editor as real page
+                            // content.
+                            if (!isOpeningDocument) {
+                                isOpeningDocument = true
+                                scope.launch {
+                                    val renderScale = 2.0f
+                                    val bitmaps = pdfRenderer.renderPdfPages(doc.file, scale = renderScale)
+                                    val pages = if (bitmaps.isNotEmpty()) {
+                                        bitmaps.mapIndexed { index, bmp ->
+                                            PageModel(
+                                                pageIndex = index,
+                                                originalBitmap = bmp,
+                                                processedBitmap = bmp,
+                                                // Convert back from rendered pixels to the PDF's
+                                                // real page size in points, so the bitmap's aspect
+                                                // ratio matches the page bounds exactly (RenderEngine
+                                                // stretches the bitmap to fill page bounds, so a
+                                                // mismatch here would visibly distort the scan).
+                                                width = bmp.width / renderScale,
+                                                height = bmp.height / renderScale
+                                            )
+                                        }
+                                    } else {
+                                        // File couldn't be rendered (corrupt/unreadable) -- fall
+                                        // back to a single blank page instead of leaving the user
+                                        // on the Home screen with no feedback at all.
+                                        Toast.makeText(context, "Gagal membuka dokumen: file tidak dapat dibaca", Toast.LENGTH_SHORT).show()
+                                        listOf(PageModel(pageIndex = 0))
+                                    }
+                                    selectedDocumentModel = DocumentModel(
+                                        title = doc.title,
+                                        filePath = doc.file.absolutePath,
+                                        pages = pages
+                                    )
+                                    isOpeningDocument = false
+                                    currentScreen = AppScreen.EDITOR
+                                }
+                            }
                         },
                         onOpenEditor = {
                             selectedDocumentModel = DocumentModel(
@@ -171,6 +215,17 @@ fun DokuPdfApp() {
                             scope.launch { repository.refreshDocuments() }
                         }
                     )
+                }
+            }
+
+            if (isOpeningDocument) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.35f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(color = Color.White)
                 }
             }
         }
