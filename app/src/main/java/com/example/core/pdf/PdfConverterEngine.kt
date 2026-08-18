@@ -22,6 +22,28 @@ class PdfConverterEngine(
 ) {
 
     /**
+     * Maps a bitmap's raw pixel dimensions to sane PDF page dimensions, in points.
+     *
+     * BUG FIX: the previous code passed `bitmap.width`/`bitmap.height` (pixels) straight into
+     * `PdfDocument.PageInfo.Builder`, which expects **points** (1/72 inch). A modern phone photo
+     * (e.g. 4000x3000px) therefore produced a "page" ~55 x 41 *inches* in size. Several PDF
+     * viewers/thumbnail generators cap how large a raster they will allocate to rasterize a page
+     * and silently give up on pages that large, which shows up to the user as a blank page even
+     * though the PDF was written successfully. Fitting the longest edge to A4's long edge keeps
+     * every generated page within a size every viewer can render.
+     */
+    private fun pdfPageSizePt(bitmap: Bitmap): Pair<Int, Int> {
+        val a4LongEdgePt = 841.89f
+        val longestPx = maxOf(bitmap.width, bitmap.height).toFloat().coerceAtLeast(1f)
+        val scale = a4LongEdgePt / longestPx
+        val w = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val h = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        return w to h
+    }
+
+    private val pageDrawPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
+    /**
      * Converts a list of image files into a single unified PDF
      */
     suspend fun imagesToPdf(
@@ -33,14 +55,15 @@ class PdfConverterEngine(
             var pageIndex = 1
             for (file in imageFiles) {
                 val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: continue
+                val (pageW, pageH) = pdfPageSizePt(bitmap)
                 val pageInfo = PdfDocument.PageInfo.Builder(
-                    bitmap.width,
-                    bitmap.height,
+                    pageW,
+                    pageH,
                     pageIndex++
                 ).create()
 
                 val page = pdfDoc.startPage(pageInfo)
-                page.canvas.drawBitmap(bitmap, 0f, 0f, null)
+                page.canvas.drawBitmap(bitmap, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
                 pdfDoc.finishPage(page)
             }
 
@@ -61,11 +84,20 @@ class PdfConverterEngine(
     }
 
     /**
-     * Converts a list of Bitmaps directly into a single multi-page PDF
+     * Converts a list of Bitmaps directly into a single multi-page PDF.
+     *
+     * @param recycleSource if true (default), each source bitmap is recycled right after it is
+     * drawn into the page, since by this point the pixels have already been copied into the
+     * PdfDocument's own (much smaller, compressed) internal representation. This matters a lot
+     * here because the caller (ScannerScreen.onSavePdf) builds the whole `bitmaps` list up front,
+     * so all pages' full-resolution pixels are briefly alive in memory at once; freeing each one
+     * as soon as it's drawn measurably lowers the peak heap usage during "Simpan PDF" on
+     * multi-page scans, which is where OutOfMemoryErrors were most likely to hit.
      */
     suspend fun bitmapsToPdf(
         bitmaps: List<Bitmap>,
-        outputPdf: File
+        outputPdf: File,
+        recycleSource: Boolean = true
     ): Result<File> = withContext(Dispatchers.IO) {
         val pdfDoc = PdfDocument()
         try {
@@ -74,15 +106,20 @@ class PdfConverterEngine(
             }
 
             for ((index, bitmap) in bitmaps.withIndex()) {
+                val (pageW, pageH) = pdfPageSizePt(bitmap)
                 val pageInfo = PdfDocument.PageInfo.Builder(
-                    bitmap.width,
-                    bitmap.height,
+                    pageW,
+                    pageH,
                     index + 1
                 ).create()
 
                 val page = pdfDoc.startPage(pageInfo)
-                page.canvas.drawBitmap(bitmap, 0f, 0f, null)
+                page.canvas.drawBitmap(bitmap, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
                 pdfDoc.finishPage(page)
+
+                if (recycleSource && !bitmap.isRecycled) {
+                    bitmap.recycle()
+                }
             }
 
             outputPdf.parentFile?.mkdirs()
@@ -92,6 +129,8 @@ class PdfConverterEngine(
             Result.success(outputPdf)
         } catch (e: Exception) {
             Result.failure(e)
+        } catch (oom: OutOfMemoryError) {
+            Result.failure(Exception("Memori tidak cukup untuk membuat PDF. Coba kurangi jumlah halaman atau nonaktifkan mode kualitas HD.", oom))
         } finally {
             pdfDoc.close()
         }
@@ -186,15 +225,17 @@ class PdfConverterEngine(
 
             for ((index, bmp) in bitmaps.withIndex()) {
                 val rotatedBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                val (pageW, pageH) = pdfPageSizePt(rotatedBmp)
                 val pageInfo = PdfDocument.PageInfo.Builder(
-                    rotatedBmp.width,
-                    rotatedBmp.height,
+                    pageW,
+                    pageH,
                     index + 1
                 ).create()
 
                 val page = pdfDoc.startPage(pageInfo)
-                page.canvas.drawBitmap(rotatedBmp, 0f, 0f, null)
+                page.canvas.drawBitmap(rotatedBmp, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
                 pdfDoc.finishPage(page)
+                rotatedBmp.recycle()
             }
 
             outputPdf.parentFile?.mkdirs()
